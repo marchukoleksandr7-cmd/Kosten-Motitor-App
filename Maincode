@@ -1,0 +1,1018 @@
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  Home, PlusCircle, Tag, Wallet, PieChart as PieChartIcon, Camera, X, Check,
+  Trash2, Edit2, Settings as SettingsIcon, ChevronLeft, ChevronRight,
+  AlertTriangle, Repeat, Bell, Loader2, ImageOff, ArrowLeft
+} from "lucide-react";
+import {
+  BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, Legend
+} from "recharts";
+
+// ---------- Design tokens (Arctic look) ----------
+const C = {
+  primary: "#2B7FE0",
+  accent: "#3C82DC",
+  bg: "#FAFBFD",
+  card: "#FFFFFF",
+  line: "#E6EBF2",
+  text: "#1C2733",
+  sub: "#7C8AA0",
+  danger: "#E15550",
+  warn: "#E0A62B",
+  ok: "#2FAE6B",
+};
+const PIE_COLORS = ["#2B7FE0", "#3C82DC", "#6FA8E8", "#A7CBF2", "#5AC8C0", "#7C8AA0"];
+
+const DEFAULT_CATEGORIES = [
+  { id: "cat-lebensmittel", name: "Lebensmittel", icon: "🛒", budgetLimit: 350, deleted: false },
+  { id: "cat-transport", name: "Transport", icon: "🚗", budgetLimit: 120, deleted: false },
+  { id: "cat-wohnen", name: "Wohnen", icon: "🏠", budgetLimit: 900, deleted: false },
+  { id: "cat-freizeit", name: "Freizeit", icon: "🎉", budgetLimit: 150, deleted: false },
+  { id: "cat-sonstiges", name: "Sonstiges", icon: "📦", budgetLimit: 100, deleted: false },
+];
+const DEFAULT_SETTINGS = { notifTime: "20:00", warn80: 80, warn100: 100, notifEnabled: true };
+
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const ymOf = (dateStr) => dateStr.slice(0, 7);
+const monthLabel = (ym) => {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString("de-DE", { month: "long", year: "numeric" });
+};
+const eur = (n) => (Number(n) || 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
+const lastDayOfMonth = (y, mIdx) => new Date(y, mIdx + 1, 0).getDate();
+
+// ---------- Storage helpers ----------
+async function loadKey(key, fallback) {
+  try {
+    const r = await window.storage.get(key);
+    return r ? JSON.parse(r.value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+async function saveKey(key, value) {
+  try {
+    await window.storage.set(key, JSON.stringify(value));
+  } catch {
+    // silent fail; UI keeps working in-memory
+  }
+}
+
+export default function App() {
+  const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState("dashboard");
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
+  const [expenses, setExpenses] = useState([]);
+  const [fixedTemplates, setFixedTemplates] = useState([]);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [meta, setMeta] = useState({ lastFixedAppliedMonth: null });
+  const [dismissedWarnings, setDismissedWarnings] = useState({});
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // ---------- Load ----------
+  useEffect(() => {
+    (async () => {
+      const [cats, exps, fixed, sett, m] = await Promise.all([
+        loadKey("km:categories", DEFAULT_CATEGORIES),
+        loadKey("km:expenses", []),
+        loadKey("km:fixedTemplates", []),
+        loadKey("km:settings", DEFAULT_SETTINGS),
+        loadKey("km:meta", { lastFixedAppliedMonth: null }),
+      ]);
+      setCategories(cats);
+      setFixedTemplates(fixed);
+      setSettings(sett);
+
+      // Apply due fixed costs (handles month-length / leap-year edge cases via clamping)
+      const now = new Date();
+      const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+      let nextExpenses = exps;
+      let nextMeta = m;
+      if (m.lastFixedAppliedMonth !== ym && fixed.length) {
+        const ld = lastDayOfMonth(now.getFullYear(), now.getMonth());
+        const additions = [];
+        fixed.filter((t) => t.active).forEach((t) => {
+          const alreadyExists = exps.some((e) => e.fixedTemplateId === t.id && e.date.startsWith(ym));
+          if (!alreadyExists) {
+            const day = Math.min(t.dayOfMonth, ld);
+            additions.push({
+              id: uid(),
+              amount: t.amount,
+              date: `${ym}-${String(day).padStart(2, "0")}`,
+              categoryId: t.categoryId,
+              receiptPhoto: null,
+              isFixed: true,
+              fixedTemplateId: t.id,
+              note: t.name,
+            });
+          }
+        });
+        nextExpenses = [...exps, ...additions];
+        nextMeta = { lastFixedAppliedMonth: ym };
+        await saveKey("km:expenses", nextExpenses);
+        await saveKey("km:meta", nextMeta);
+      }
+      setExpenses(nextExpenses);
+      setMeta(nextMeta);
+      setLoading(false);
+    })();
+  }, []);
+
+  // ---------- Persist on change (after initial load) ----------
+  const firstRun = useRef(true);
+  useEffect(() => {
+    if (firstRun.current) { firstRun.current = false; return; }
+    saveKey("km:categories", categories);
+  }, [categories]);
+  useEffect(() => { if (!loading) saveKey("km:expenses", expenses); }, [expenses, loading]);
+  useEffect(() => { if (!loading) saveKey("km:fixedTemplates", fixedTemplates); }, [fixedTemplates, loading]);
+  useEffect(() => { if (!loading) saveKey("km:settings", settings); }, [settings, loading]);
+
+  const activeCategories = useMemo(() => categories.filter((c) => !c.deleted), [categories]);
+  const currentYm = useMemo(() => todayISO().slice(0, 7), []);
+
+  const monthExpenses = useMemo(
+    () => expenses.filter((e) => ymOf(e.date) === currentYm),
+    [expenses, currentYm]
+  );
+
+  const spentByCategory = useMemo(() => {
+    const map = {};
+    monthExpenses.forEach((e) => { map[e.categoryId] = (map[e.categoryId] || 0) + Number(e.amount); });
+    return map;
+  }, [monthExpenses]);
+
+  const budgetWarnings = useMemo(() => {
+    return activeCategories
+      .filter((c) => c.budgetLimit > 0)
+      .map((c) => {
+        const spent = spentByCategory[c.id] || 0;
+        const pct = (spent / c.budgetLimit) * 100;
+        return { ...c, spent, pct };
+      })
+      .filter((c) => c.pct >= settings.warn80)
+      .filter((c) => !dismissedWarnings[c.id + "-" + Math.floor(c.pct / 10)]);
+  }, [activeCategories, spentByCategory, settings.warn80, dismissedWarnings]);
+
+  if (loading) {
+    return (
+      <div style={{ background: C.bg }} className="min-h-screen flex items-center justify-center">
+        <Loader2 className="animate-spin" size={28} color={C.primary} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: C.bg, color: C.text }} className="min-h-screen font-sans flex flex-col max-w-md mx-auto relative">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Inter:wght@400;500;600&display=swap');
+        .font-sans { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; }
+        .font-display { font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif; }
+        * { -webkit-tap-highlight-color: transparent; }
+        input, select { font-family: inherit; }
+      `}</style>
+
+      <Header page={page} onSettings={() => setSettingsOpen(true)} />
+
+      <main className="flex-1 overflow-y-auto pb-24 px-4 pt-3">
+        {page === "dashboard" && (
+          <Dashboard
+            categories={activeCategories}
+            spentByCategory={spentByCategory}
+            monthExpenses={monthExpenses}
+            currentYm={currentYm}
+            warnings={budgetWarnings}
+            onDismiss={(c) => setDismissedWarnings((d) => ({ ...d, [c.id + "-" + Math.floor(c.pct / 10)]: true }))}
+            goErfassen={() => setPage("erfassen")}
+          />
+        )}
+        {page === "erfassen" && (
+          <Erfasser
+            categories={activeCategories}
+            onSave={(exp) => { setExpenses((es) => [...es, exp]); setPage("dashboard"); }}
+            onCancel={() => setPage("dashboard")}
+          />
+        )}
+        {page === "kategorien" && (
+          <Kategorien
+            categories={categories}
+            expenses={expenses}
+            setCategories={setCategories}
+            setExpenses={setExpenses}
+          />
+        )}
+        {page === "budget" && (
+          <BudgetPlaner
+            categories={activeCategories}
+            setCategories={setCategories}
+            fixedTemplates={fixedTemplates}
+            setFixedTemplates={setFixedTemplates}
+          />
+        )}
+        {page === "analyse" && (
+          <Auswertung categories={categories} expenses={expenses} />
+        )}
+      </main>
+
+      <BottomNav page={page} setPage={setPage} />
+
+      {settingsOpen && (
+        <SettingsModal settings={settings} setSettings={setSettings} onClose={() => setSettingsOpen(false)} />
+      )}
+    </div>
+  );
+}
+
+// ---------- Header ----------
+const TITLES = {
+  dashboard: "Kosten-Übersicht",
+  erfassen: "Ausgabe erfassen",
+  kategorien: "Kategorien",
+  budget: "Budget-Planer",
+  analyse: "Auswertung",
+};
+function Header({ page, onSettings }) {
+  return (
+    <header className="px-4 pt-5 pb-3 flex items-center justify-between">
+      <div>
+        <p className="text-xs font-medium tracking-wide" style={{ color: C.sub }}>KOSTEN MONITOR</p>
+        <h1 className="font-display font-extrabold text-xl" style={{ color: C.text }}>{TITLES[page]}</h1>
+      </div>
+      <button
+        onClick={onSettings}
+        aria-label="Einstellungen"
+        className="w-10 h-10 rounded-full flex items-center justify-center active:scale-95 transition"
+        style={{ background: C.card, border: `1px solid ${C.line}` }}
+      >
+        <SettingsIcon size={18} color={C.sub} />
+      </button>
+    </header>
+  );
+}
+
+// ---------- Bottom Nav ----------
+function BottomNav({ page, setPage }) {
+  const items = [
+    { id: "dashboard", label: "Übersicht", icon: Home },
+    { id: "kategorien", label: "Kategorien", icon: Tag },
+    { id: "erfassen", label: "", icon: PlusCircle, center: true },
+    { id: "budget", label: "Budget", icon: Wallet },
+    { id: "analyse", label: "Analyse", icon: PieChartIcon },
+  ];
+  return (
+    <nav
+      className="fixed bottom-0 left-0 right-0 max-w-md mx-auto flex items-center justify-around px-2 py-2"
+      style={{ background: C.card, borderTop: `1px solid ${C.line}` }}
+    >
+      {items.map((it) => {
+        const Icon = it.icon;
+        const active = page === it.id;
+        if (it.center) {
+          return (
+            <button
+              key={it.id}
+              onClick={() => setPage("erfassen")}
+              aria-label="Ausgabe erfassen"
+              className="w-14 h-14 rounded-full flex items-center justify-center -mt-6 shadow-lg active:scale-95 transition"
+              style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}
+            >
+              <PlusCircle size={28} color="#fff" strokeWidth={2} />
+            </button>
+          );
+        }
+        return (
+          <button
+            key={it.id}
+            onClick={() => setPage(it.id)}
+            className="flex flex-col items-center gap-1 px-2 py-1 active:scale-95 transition"
+          >
+            <Icon size={20} color={active ? C.primary : C.sub} strokeWidth={active ? 2.5 : 2} />
+            <span className="text-[10px] font-medium" style={{ color: active ? C.primary : C.sub }}>{it.label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+// ---------- Dashboard ----------
+function Dashboard({ categories, spentByCategory, monthExpenses, currentYm, warnings, onDismiss, goErfassen }) {
+  const total = monthExpenses.reduce((s, e) => s + Number(e.amount), 0);
+  const totalBudget = categories.reduce((s, c) => s + (Number(c.budgetLimit) || 0), 0);
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Total card */}
+      <div
+        className="rounded-2xl p-5 text-white"
+        style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}
+      >
+        <p className="text-xs opacity-80 font-medium">{monthLabel(currentYm)}</p>
+        <p className="font-display font-extrabold text-3xl mt-1">{eur(total)}</p>
+        {totalBudget > 0 && (
+          <>
+            <div className="mt-3 h-2 rounded-full bg-white/25 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-white"
+                style={{ width: `${Math.min(100, (total / totalBudget) * 100)}%` }}
+              />
+            </div>
+            <p className="text-xs opacity-80 mt-1.5">von {eur(totalBudget)} Gesamtbudget</p>
+          </>
+        )}
+      </div>
+
+      {/* Warnings */}
+      {warnings.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {warnings.map((w) => {
+            const over = w.pct >= 100;
+            return (
+              <div
+                key={w.id}
+                className="rounded-xl p-3 flex items-start gap-2.5"
+                style={{ background: over ? "#FCEAEA" : "#FDF3E1", border: `1px solid ${over ? "#F5C9C7" : "#F3DFB0"}` }}
+              >
+                <AlertTriangle size={18} color={over ? C.danger : C.warn} className="mt-0.5 shrink-0" />
+                <div className="flex-1">
+                  <p className="text-sm font-semibold" style={{ color: over ? C.danger : "#8A6410" }}>
+                    {w.icon} {w.name}: {Math.round(w.pct)}% des Budgets
+                  </p>
+                  <p className="text-xs mt-0.5" style={{ color: C.sub }}>
+                    {eur(w.spent)} von {eur(w.budgetLimit)} {over ? "— Budget überschritten" : "ausgegeben"}
+                  </p>
+                </div>
+                <button onClick={() => onDismiss(w)} className="p-1"><X size={14} color={C.sub} /></button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Category progress */}
+      <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <p className="font-display font-bold text-sm mb-3" style={{ color: C.text }}>Budgets nach Kategorie</p>
+        {categories.filter((c) => c.budgetLimit > 0).length === 0 && (
+          <p className="text-sm" style={{ color: C.sub }}>Noch keine Budgets festgelegt.</p>
+        )}
+        <div className="flex flex-col gap-3">
+          {categories.filter((c) => c.budgetLimit > 0).map((c) => {
+            const spent = spentByCategory[c.id] || 0;
+            const pct = Math.min(100, (spent / c.budgetLimit) * 100);
+            const over = spent > c.budgetLimit;
+            return (
+              <div key={c.id}>
+                <div className="flex justify-between text-xs mb-1">
+                  <span style={{ color: C.text }}>{c.icon} {c.name}</span>
+                  <span style={{ color: over ? C.danger : C.sub }}>{eur(spent)} / {eur(c.budgetLimit)}</span>
+                </div>
+                <div className="h-1.5 rounded-full" style={{ background: C.line }}>
+                  <div
+                    className="h-full rounded-full"
+                    style={{ width: `${pct}%`, background: over ? C.danger : pct >= 80 ? C.warn : C.primary }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Recent expenses */}
+      <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <p className="font-display font-bold text-sm mb-3">Letzte Ausgaben</p>
+        {monthExpenses.length === 0 ? (
+          <button onClick={goErfassen} className="text-sm w-full text-center py-6" style={{ color: C.sub }}>
+            Noch keine Ausgaben in diesem Monat.<br />
+            <span style={{ color: C.primary }} className="font-medium">Erste Ausgabe erfassen →</span>
+          </button>
+        ) : (
+          <div className="flex flex-col gap-2.5">
+            {[...monthExpenses].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6).map((e) => {
+              const cat = categories.find((c) => c.id === e.categoryId);
+              return (
+                <div key={e.id} className="flex items-center justify-between">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-9 h-9 rounded-full flex items-center justify-center text-base" style={{ background: C.bg }}>
+                      {cat?.icon || "📦"}
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium">{cat?.name || "Gelöschte Kategorie"} {e.isFixed && <Repeat size={11} className="inline ml-1" color={C.sub} />}</p>
+                      <p className="text-xs" style={{ color: C.sub }}>{new Date(e.date).toLocaleDateString("de-DE")}</p>
+                    </div>
+                  </div>
+                  <span className="text-sm font-semibold">{eur(e.amount)}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Ausgaben-Erfasser ----------
+function Erfasser({ categories, onSave, onCancel }) {
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [categoryId, setCategoryId] = useState(categories[0]?.id || "");
+  const [photo, setPhoto] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanNotice, setScanNotice] = useState(null);
+  const fileRef = useRef(null);
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const dataUrl = reader.result;
+      const base64 = dataUrl.split(",")[1];
+      const mediaType = file.type || "image/jpeg";
+      setPhoto(dataUrl);
+      setScanning(true);
+      setScanNotice(null);
+      try {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            max_tokens: 1000,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
+                {
+                  type: "text",
+                  text: "Das ist ein Foto eines Kassenbons/Belegs. Extrahiere den Gesamtbetrag (als Zahl mit Punkt als Dezimaltrennzeichen) und das Datum (Format YYYY-MM-DD). Antworte AUSSCHLIESSLICH mit einem JSON-Objekt, keine Erklärung, kein Markdown: {\"amount\": <Zahl oder null>, \"date\": \"YYYY-MM-DD\" oder null, \"readable\": true oder false}. Setze readable auf false, wenn der Beleg unscharf, abgeschnitten oder unlesbar ist.",
+                },
+              ],
+            }],
+          }),
+        });
+        const data = await response.json();
+        const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+        const clean = text.replace(/```json|```/g, "").trim();
+        const parsed = JSON.parse(clean);
+        if (!parsed.readable || parsed.amount == null) {
+          setScanNotice({ type: "warn", msg: "Beleg konnte nicht sicher gelesen werden. Bitte Betrag und Datum manuell prüfen." });
+        } else {
+          if (parsed.amount) setAmount(String(parsed.amount));
+          if (parsed.date && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) setDate(parsed.date);
+          setScanNotice({ type: "ok", msg: "Betrag und Datum wurden automatisch erkannt — bitte kurz prüfen." });
+        }
+      } catch (err) {
+        setScanNotice({ type: "warn", msg: "Scan fehlgeschlagen. Bitte Betrag und Datum manuell eingeben." });
+      } finally {
+        setScanning(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const canSave = amount && Number(amount) > 0 && categoryId && date;
+  const save = () => {
+    onSave({
+      id: uid(),
+      amount: Number(amount),
+      date,
+      categoryId,
+      receiptPhoto: photo,
+      isFixed: false,
+      note: "",
+    });
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <button onClick={onCancel} className="flex items-center gap-1.5 text-sm font-medium" style={{ color: C.sub }}>
+        <ArrowLeft size={16} /> Zurück
+      </button>
+
+      {/* Receipt scan */}
+      <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={(e) => handleFile(e.target.files?.[0])}
+        />
+        {!photo ? (
+          <button
+            onClick={() => fileRef.current?.click()}
+            className="w-full flex flex-col items-center justify-center gap-2 py-8 rounded-xl border-2 border-dashed active:scale-[0.99] transition"
+            style={{ borderColor: C.line }}
+          >
+            <Camera size={26} color={C.primary} />
+            <span className="text-sm font-medium" style={{ color: C.primary }}>Beleg scannen</span>
+            <span className="text-xs" style={{ color: C.sub }}>Betrag & Datum werden automatisch erkannt</span>
+          </button>
+        ) : (
+          <div className="flex gap-3 items-center">
+            <img src={photo} alt="Beleg" className="w-16 h-16 rounded-lg object-cover" style={{ border: `1px solid ${C.line}` }} />
+            <div className="flex-1">
+              {scanning ? (
+                <p className="text-sm flex items-center gap-1.5" style={{ color: C.sub }}>
+                  <Loader2 size={14} className="animate-spin" /> Beleg wird analysiert…
+                </p>
+              ) : scanNotice ? (
+                <p className="text-xs" style={{ color: scanNotice.type === "ok" ? C.ok : C.warn }}>
+                  {scanNotice.type === "warn" && <ImageOff size={12} className="inline mr-1 -mt-0.5" />}
+                  {scanNotice.msg}
+                </p>
+              ) : null}
+              <button onClick={() => { setPhoto(null); setScanNotice(null); }} className="text-xs font-medium mt-1" style={{ color: C.primary }}>
+                Foto entfernen
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Form */}
+      <div className="rounded-2xl p-4 flex flex-col gap-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Betrag (€)</label>
+          <input
+            type="number" inputMode="decimal" step="0.01" placeholder="0,00"
+            value={amount} onChange={(e) => setAmount(e.target.value)}
+            className="w-full mt-1 text-2xl font-display font-bold outline-none bg-transparent"
+            style={{ color: C.text }}
+          />
+        </div>
+        <div className="h-px" style={{ background: C.line }} />
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Kategorie</label>
+          <select
+            value={categoryId} onChange={(e) => setCategoryId(e.target.value)}
+            className="w-full mt-1 text-sm py-2 rounded-lg outline-none"
+            style={{ color: C.text, background: C.bg, border: `1px solid ${C.line}` }}
+          >
+            {categories.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Datum</label>
+          <input
+            type="date" value={date} onChange={(e) => setDate(e.target.value)}
+            className="w-full mt-1 text-sm py-2 rounded-lg outline-none"
+            style={{ color: C.text, background: C.bg, border: `1px solid ${C.line}` }}
+          />
+        </div>
+      </div>
+
+      <button
+        disabled={!canSave}
+        onClick={save}
+        className="w-full py-3.5 rounded-xl font-semibold text-white flex items-center justify-center gap-2 active:scale-[0.99] transition disabled:opacity-40"
+        style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}
+      >
+        <Check size={18} /> Ausgabe speichern
+      </button>
+    </div>
+  );
+}
+
+// ---------- Kategorie-Manager ----------
+const ICON_CHOICES = ["🛒", "🚗", "🏠", "🎉", "📦", "💊", "🍽️", "👕", "📱", "🎓", "✈️", "🐾", "💡", "🎁"];
+
+function Kategorien({ categories, expenses, setCategories, setExpenses }) {
+  const [editing, setEditing] = useState(null); // category or "new"
+  const [reassignTarget, setReassignTarget] = useState(null); // category pending delete
+
+  const activeCats = categories.filter((c) => !c.deleted);
+  const countFor = (id) => expenses.filter((e) => e.categoryId === id).length;
+
+  const startNew = () => setEditing({ id: null, name: "", icon: "📦", budgetLimit: "" });
+  const save = (cat) => {
+    if (cat.id) {
+      setCategories((cs) => cs.map((c) => (c.id === cat.id ? { ...c, ...cat, budgetLimit: Number(cat.budgetLimit) || 0 } : c)));
+    } else {
+      setCategories((cs) => [...cs, { ...cat, id: uid(), deleted: false, budgetLimit: Number(cat.budgetLimit) || 0 }]);
+    }
+    setEditing(null);
+  };
+
+  const requestDelete = (cat) => {
+    if (countFor(cat.id) > 0) setReassignTarget(cat);
+    else setCategories((cs) => cs.filter((c) => c.id !== cat.id));
+  };
+
+  const archiveCategory = (cat) => {
+    setCategories((cs) => cs.map((c) => (c.id === cat.id ? { ...c, deleted: true } : c)));
+    setReassignTarget(null);
+  };
+  const reassignAndDelete = (cat, targetId) => {
+    setExpenses((es) => es.map((e) => (e.categoryId === cat.id ? { ...e, categoryId: targetId } : e)));
+    setCategories((cs) => cs.filter((c) => c.id !== cat.id));
+    setReassignTarget(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <button
+        onClick={startNew}
+        className="w-full py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 active:scale-[0.99] transition"
+        style={{ color: C.primary, background: "#EAF2FD", border: `1px dashed ${C.primary}` }}
+      >
+        <PlusCircle size={17} /> Neue Kategorie
+      </button>
+
+      <div className="flex flex-col gap-2">
+        {activeCats.map((c) => (
+          <div key={c.id} className="rounded-xl p-3.5 flex items-center justify-between" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full flex items-center justify-center text-lg" style={{ background: C.bg }}>{c.icon}</div>
+              <div>
+                <p className="text-sm font-semibold">{c.name}</p>
+                <p className="text-xs" style={{ color: C.sub }}>{c.budgetLimit > 0 ? `Budget: ${eur(c.budgetLimit)}` : "Kein Budget"} · {countFor(c.id)} Ausgaben</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1">
+              <button onClick={() => setEditing(c)} className="p-2"><Edit2 size={15} color={C.sub} /></button>
+              <button onClick={() => requestDelete(c)} className="p-2"><Trash2 size={15} color={C.danger} /></button>
+            </div>
+          </div>
+        ))}
+        {activeCats.length === 0 && <p className="text-sm text-center py-6" style={{ color: C.sub }}>Keine Kategorien vorhanden.</p>}
+      </div>
+
+      {categories.some((c) => c.deleted) && (
+        <details className="text-xs mt-2" style={{ color: C.sub }}>
+          <summary className="cursor-pointer font-medium">Archivierte Kategorien</summary>
+          <div className="mt-2 flex flex-col gap-1.5">
+            {categories.filter((c) => c.deleted).map((c) => (
+              <div key={c.id} className="flex items-center justify-between py-1">
+                <span>{c.icon} {c.name} ({countFor(c.id)} Ausgaben im Verlauf)</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {editing && (
+        <CategoryEditModal cat={editing} onSave={save} onClose={() => setEditing(null)} />
+      )}
+
+      {reassignTarget && (
+        <ReassignModal
+          cat={reassignTarget}
+          options={activeCats.filter((c) => c.id !== reassignTarget.id)}
+          count={countFor(reassignTarget.id)}
+          onArchive={() => archiveCategory(reassignTarget)}
+          onReassign={(targetId) => reassignAndDelete(reassignTarget, targetId)}
+          onClose={() => setReassignTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+function CategoryEditModal({ cat, onSave, onClose }) {
+  const [name, setName] = useState(cat.name);
+  const [icon, setIcon] = useState(cat.icon);
+  const [budgetLimit, setBudgetLimit] = useState(cat.budgetLimit || "");
+  return (
+    <ModalShell title={cat.id ? "Kategorie bearbeiten" : "Neue Kategorie"} onClose={onClose}>
+      <div className="flex flex-col gap-4">
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Icon</label>
+          <div className="flex flex-wrap gap-2 mt-1.5">
+            {ICON_CHOICES.map((i) => (
+              <button
+                key={i} onClick={() => setIcon(i)}
+                className="w-9 h-9 rounded-full flex items-center justify-center text-lg"
+                style={{ background: icon === i ? C.primary + "22" : C.bg, border: `1px solid ${icon === i ? C.primary : C.line}` }}
+              >{i}</button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Name</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="z. B. Gesundheit"
+            className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+        </div>
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Monatliches Budget (€, optional)</label>
+          <input type="number" inputMode="decimal" value={budgetLimit} onChange={(e) => setBudgetLimit(e.target.value)} placeholder="0"
+            className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+        </div>
+        <button
+          disabled={!name.trim()}
+          onClick={() => onSave({ id: cat.id, name: name.trim(), icon, budgetLimit })}
+          className="w-full py-3 rounded-xl font-semibold text-white disabled:opacity-40"
+          style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}
+        >Speichern</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function ReassignModal({ cat, options, count, onArchive, onReassign, onClose }) {
+  const [target, setTarget] = useState(options[0]?.id || "");
+  return (
+    <ModalShell title={`"${cat.name}" löschen`} onClose={onClose}>
+      <p className="text-sm mb-4" style={{ color: C.sub }}>
+        Diese Kategorie hat {count} verknüpfte Ausgabe{count === 1 ? "" : "n"}. Wähle, was damit passieren soll.
+      </p>
+      {options.length > 0 && (
+        <div className="mb-3">
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Ausgaben neu zuweisen an</label>
+          <select value={target} onChange={(e) => setTarget(e.target.value)}
+            className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }}>
+            {options.map((o) => <option key={o.id} value={o.id}>{o.icon} {o.name}</option>)}
+          </select>
+          <button onClick={() => onReassign(target)} className="w-full mt-2 py-2.5 rounded-xl font-semibold text-white"
+            style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}>
+            Zuweisen &amp; löschen
+          </button>
+        </div>
+      )}
+      <button onClick={onArchive} className="w-full py-2.5 rounded-xl font-semibold text-sm" style={{ color: C.text, background: C.bg, border: `1px solid ${C.line}` }}>
+        Stattdessen archivieren (Verlauf bleibt sichtbar)
+      </button>
+    </ModalShell>
+  );
+}
+
+// ---------- Budget-Planer ----------
+function BudgetPlaner({ categories, setCategories, fixedTemplates, setFixedTemplates }) {
+  const [tab, setTab] = useState("budgets");
+  const [editingFixed, setEditingFixed] = useState(null);
+
+  const updateBudget = (id, value) => {
+    setCategories((cs) => cs.map((c) => (c.id === id ? { ...c, budgetLimit: Number(value) || 0 } : c)));
+  };
+
+  const saveFixed = (tpl) => {
+    if (tpl.id) setFixedTemplates((ts) => ts.map((t) => (t.id === tpl.id ? tpl : t)));
+    else setFixedTemplates((ts) => [...ts, { ...tpl, id: uid(), active: true }]);
+    setEditingFixed(null);
+  };
+  const toggleFixed = (id) => setFixedTemplates((ts) => ts.map((t) => (t.id === id ? { ...t, active: !t.active } : t)));
+  const deleteFixed = (id) => setFixedTemplates((ts) => ts.filter((t) => t.id !== id));
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex rounded-xl p-1" style={{ background: C.line }}>
+        {[["budgets", "Budgets"], ["fixed", "Fixkosten"]].map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)} className="flex-1 py-2 rounded-lg text-sm font-semibold transition"
+            style={{ background: tab === id ? C.card : "transparent", color: tab === id ? C.primary : C.sub }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "budgets" && (
+        <div className="flex flex-col gap-2">
+          {categories.map((c) => (
+            <div key={c.id} className="rounded-xl p-3.5 flex items-center justify-between gap-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+              <div className="flex items-center gap-2.5">
+                <span className="text-lg">{c.icon}</span>
+                <span className="text-sm font-medium">{c.name}</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-sm" style={{ color: C.sub }}>€</span>
+                <input
+                  type="number" inputMode="decimal" defaultValue={c.budgetLimit || ""}
+                  onBlur={(e) => updateBudget(c.id, e.target.value)}
+                  placeholder="0"
+                  className="w-20 text-sm py-1.5 px-2 rounded-lg outline-none text-right"
+                  style={{ background: C.bg, border: `1px solid ${C.line}` }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "fixed" && (
+        <div className="flex flex-col gap-3">
+          <button onClick={() => setEditingFixed({ id: null, name: "", categoryId: categories[0]?.id, amount: "", dayOfMonth: 1 })}
+            className="w-full py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2"
+            style={{ color: C.primary, background: "#EAF2FD", border: `1px dashed ${C.primary}` }}>
+            <PlusCircle size={17} /> Neue Fixkosten
+          </button>
+          {fixedTemplates.length === 0 && <p className="text-sm text-center py-4" style={{ color: C.sub }}>Noch keine wiederkehrenden Buchungen (z. B. Miete, Abos).</p>}
+          {fixedTemplates.map((t) => {
+            const cat = categories.find((c) => c.id === t.categoryId);
+            return (
+              <div key={t.id} className="rounded-xl p-3.5 flex items-center justify-between" style={{ background: C.card, border: `1px solid ${C.line}`, opacity: t.active ? 1 : 0.5 }}>
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-full flex items-center justify-center text-base" style={{ background: C.bg }}>{cat?.icon || "🔁"}</div>
+                  <div>
+                    <p className="text-sm font-semibold">{t.name}</p>
+                    <p className="text-xs" style={{ color: C.sub }}>{eur(t.amount)} · jeden {t.dayOfMonth}. des Monats</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1">
+                  <button onClick={() => toggleFixed(t.id)} className="text-xs font-medium px-2 py-1 rounded-lg" style={{ color: t.active ? C.ok : C.sub, background: C.bg }}>
+                    {t.active ? "Aktiv" : "Pausiert"}
+                  </button>
+                  <button onClick={() => setEditingFixed(t)} className="p-2"><Edit2 size={14} color={C.sub} /></button>
+                  <button onClick={() => deleteFixed(t.id)} className="p-2"><Trash2 size={14} color={C.danger} /></button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {editingFixed && (
+        <FixedCostModal tpl={editingFixed} categories={categories} onSave={saveFixed} onClose={() => setEditingFixed(null)} />
+      )}
+    </div>
+  );
+}
+function FixedCostModal({ tpl, categories, onSave, onClose }) {
+  const [name, setName] = useState(tpl.name);
+  const [categoryId, setCategoryId] = useState(tpl.categoryId);
+  const [amount, setAmount] = useState(tpl.amount);
+  const [dayOfMonth, setDayOfMonth] = useState(tpl.dayOfMonth);
+  const canSave = name.trim() && Number(amount) > 0 && categoryId;
+  return (
+    <ModalShell title={tpl.id ? "Fixkosten bearbeiten" : "Neue Fixkosten"} onClose={onClose}>
+      <div className="flex flex-col gap-4">
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Bezeichnung</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="z. B. Miete"
+            className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+        </div>
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Kategorie</label>
+          <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)}
+            className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }}>
+            {categories.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}
+          </select>
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <label className="text-xs font-medium" style={{ color: C.sub }}>Betrag (€)</label>
+            <input type="number" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)}
+              className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+          </div>
+          <div className="flex-1">
+            <label className="text-xs font-medium" style={{ color: C.sub }}>Tag im Monat</label>
+            <input type="number" min="1" max="31" value={dayOfMonth} onChange={(e) => setDayOfMonth(Number(e.target.value))}
+              className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+          </div>
+        </div>
+        <p className="text-xs" style={{ color: C.sub }}>Bei Monaten mit weniger Tagen wird automatisch auf den letzten Tag des Monats angepasst.</p>
+        <button disabled={!canSave} onClick={() => onSave({ id: tpl.id, name: name.trim(), categoryId, amount: Number(amount), dayOfMonth })}
+          className="w-full py-3 rounded-xl font-semibold text-white disabled:opacity-40"
+          style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}>
+          Speichern
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+// ---------- Auswertungs-Analyse ----------
+function Auswertung({ categories, expenses }) {
+  const allMonths = useMemo(() => {
+    const set = new Set(expenses.map((e) => ymOf(e.date)));
+    set.add(todayISO().slice(0, 7));
+    return [...set].sort();
+  }, [expenses]);
+  const [selectedYm, setSelectedYm] = useState(allMonths[allMonths.length - 1]);
+  const idx = allMonths.indexOf(selectedYm);
+
+  const monthData = expenses.filter((e) => ymOf(e.date) === selectedYm);
+  const total = monthData.reduce((s, e) => s + Number(e.amount), 0);
+
+  const byCategory = useMemo(() => {
+    const map = {};
+    monthData.forEach((e) => {
+      const cat = categories.find((c) => c.id === e.categoryId);
+      const name = cat ? `${cat.icon} ${cat.name}` : "Sonstiges";
+      map[name] = (map[name] || 0) + Number(e.amount);
+    });
+    return Object.entries(map).map(([name, value]) => ({ name, value }));
+  }, [monthData, categories]);
+
+  const last6 = allMonths.slice(-6);
+  const comparisonData = last6.map((ym) => ({
+    ym: monthLabel(ym).split(" ")[0].slice(0, 3),
+    total: expenses.filter((e) => ymOf(e.date) === ym).reduce((s, e) => s + Number(e.amount), 0),
+  }));
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between rounded-xl p-2" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <button disabled={idx <= 0} onClick={() => setSelectedYm(allMonths[idx - 1])} className="p-2 disabled:opacity-30">
+          <ChevronLeft size={18} color={C.sub} />
+        </button>
+        <span className="text-sm font-semibold font-display">{monthLabel(selectedYm)}</span>
+        <button disabled={idx >= allMonths.length - 1} onClick={() => setSelectedYm(allMonths[idx + 1])} className="p-2 disabled:opacity-30">
+          <ChevronRight size={18} color={C.sub} />
+        </button>
+      </div>
+
+      <div className="rounded-2xl p-4 text-center" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <p className="text-xs" style={{ color: C.sub }}>Gesamtausgaben</p>
+        <p className="font-display font-extrabold text-2xl mt-1">{eur(total)}</p>
+      </div>
+      <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <p className="font-display font-bold text-sm mb-2">Verteilung nach Kategorie</p>
+        {byCategory.length === 0 ? (
+          <p className="text-sm py-6 text-center" style={{ color: C.sub }}>Keine Ausgaben in diesem Monat.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={220}>
+            <PieChart>
+              <Pie data={byCategory} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={45} outerRadius={80} paddingAngle={2}>
+                {byCategory.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+              </Pie>
+              <Tooltip formatter={(v) => eur(v)} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+            </PieChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
+      <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <p className="font-display font-bold text-sm mb-2">Monatsvergleich</p>
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={comparisonData}>
+            <CartesianGrid strokeDasharray="3 3" stroke={C.line} vertical={false} />
+            <XAxis dataKey="ym" tick={{ fontSize: 11, fill: C.sub }} axisLine={false} tickLine={false} />
+            <YAxis tick={{ fontSize: 11, fill: C.sub }} axisLine={false} tickLine={false} width={36} />
+            <Tooltip formatter={(v) => eur(v)} />
+            <Bar dataKey="total" fill={C.primary} radius={[6, 6, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Settings modal ----------
+function SettingsModal({ settings, setSettings, onClose }) {
+  const [notifTime, setNotifTime] = useState(settings.notifTime);
+  const [warn80, setWarn80] = useState(settings.warn80);
+  const [notifEnabled, setNotifEnabled] = useState(settings.notifEnabled);
+
+  const save = () => {
+    setSettings({ ...settings, notifTime, warn80: Number(warn80), notifEnabled });
+    onClose();
+  };
+
+  return (
+    <ModalShell title="Einstellungen" onClose={onClose}>
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium flex items-center gap-1.5"><Bell size={14} /> Tägliche Erinnerung</p>
+            <p className="text-xs" style={{ color: C.sub }}>Erinnert dich, Ausgaben zu erfassen</p>
+          </div>
+          <button onClick={() => setNotifEnabled((v) => !v)} className="w-11 h-6 rounded-full relative transition"
+            style={{ background: notifEnabled ? C.primary : C.line }}>
+            <span className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition" style={{ left: notifEnabled ? 22 : 2 }} />
+          </button>
+        </div>
+        {notifEnabled && (
+          <div>
+            <label className="text-xs font-medium" style={{ color: C.sub }}>Uhrzeit</label>
+            <input type="time" value={notifTime} onChange={(e) => setNotifTime(e.target.value)}
+              className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+          </div>
+        )}
+        <div className="h-px" style={{ background: C.line }} />
+        <div>
+          <label className="text-xs font-medium" style={{ color: C.sub }}>Budgetwarnung ab (%)</label>
+          <input type="number" min="1" max="99" value={warn80} onChange={(e) => setWarn80(e.target.value)}
+            className="w-full mt-1 text-sm py-2 px-3 rounded-lg outline-none" style={{ background: C.bg, border: `1px solid ${C.line}` }} />
+          <p className="text-xs mt-1" style={{ color: C.sub }}>Zusätzlich wird bei 100 % immer gewarnt.</p>
+        </div>
+        <button onClick={save} className="w-full py-3 rounded-xl font-semibold text-white"
+          style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}>
+          Speichern
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+// ---------- Modal shell ----------
+function ModalShell({ title, onClose, children }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(20,30,45,0.4)" }} onClick={onClose}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-md rounded-t-3xl p-5 pb-8 max-h-[85vh] overflow-y-auto"
+        style={{ background: C.card }}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-display font-bold text-lg">{title}</h2>
+          <button onClick={onClose} className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: C.bg }}>
+            <X size={16} color={C.sub} />
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
